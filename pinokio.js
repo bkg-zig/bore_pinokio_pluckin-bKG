@@ -49,17 +49,27 @@ function installSteps(kernel, ctx) {
   }]
 }
 
+const binary = (kernel) => kernel.platform === "win32" ? "bore.exe" : "bore"
+
 module.exports = {
-  version: "7.0",
-  title: "Bore Tunnel",
-  description: "Expose a running app's local TCP port through a Bore tunnel.",
+  version: "8.0",
+  title: "Bore Auto-Tunnel",
+  description: "Tunnels every running Pinokio app automatically to bore.pub with no manual port input.",
   link: "https://github.com/ekzhang/bore",
-  path: "plugin",
-  launch_type: "terminal",
+  icon: "fa-solid fa-satellite-dish",
+  menu: [{
+    icon: "fa-solid fa-rocket",
+    text: "Start auto-tunnel",
+    href: "/plugin/run"
+  }, {
+    icon: "fa-solid fa-stop",
+    text: "Stop auto-tunnel",
+    href: "/plugin/stop"
+  }],
 
   installed: async (kernel, info, ctx) => {
-    const binary = kernel.platform === "win32" ? "bore.exe" : "bore"
-    return await kernel.exists(__dirname, binary)
+    const b = binary(kernel)
+    return await kernel.exists(__dirname, b)
   },
 
   install: async (kernel, info, ctx) => installSteps(kernel, ctx),
@@ -67,88 +77,85 @@ module.exports = {
   uninstall: async (kernel, info, ctx) => [{
     method: "fs.rm",
     params: {
-      path: `${ctx.dirname}/${kernel.platform === "win32" ? "bore.exe" : "bore"}`
+      path: `${ctx.dirname}/${binary(kernel)}`
     }
   }],
 
-  run: async (kernel) => {
-    const binary = kernel.platform === "win32"
-      ? `"{{dirname}}\\bore.exe"`
-      : `"{{dirname}}/bore"`
-    const message = `${binary} local {{local.port}}`
+  stop: async (kernel) => {
+    return [{
+      method: "shell.run",
+      params: {
+        message: "pkill -f 'bore.*local.*:[0-9]' 2>/dev/null; pkill -f bore-pinokio-auto 2>/dev/null; echo stopped",
+        path: __dirname
+      }
+    }]
+  },
+
+  run: async (kernel, info, ctx) => {
+    const b = `"${ctx.dirname}/${binary(kernel)}"`
+    // Auto-tunnel script: watch Pinokio's running processes/ports and start bore for each HTTP service
+    const script = `cat > "${ctx.dirname}/bore-pinokio-auto.sh" << 'SCRIPT'
+#!/bin/bash
+SERVER="\${BORE_SERVER:-bore.pub}"
+SECRET="\${BORE_SECRET:-}"
+BORE_BIN="$b"
+LOG="/tmp/bore-auto.log"
+declare -A TUNNELED
+echo "[$(date)] bore-auto started server=$SERVER" >> $LOG
+while true; do
+  # Find listening TCP ports that look like web apps (skip bore, ssh, nginx)
+  for port in $(ss -Htnlp 2>/dev/null | awk '{print $4}' | grep -oE ':[0-9]+$' | tr -d ':' | grep -vE '^(22|53|3000|3001|3002|10032)$' | sort -u); do
+    # Check if already tunneling
+    if [ -n "\${TUNNELED[$port]:-}" ]; then
+      # still running?
+      if kill -0 \${TUNNELED[$port]} 2>/dev/null; then
+        continue
+      else
+        unset TUNNELED[$port]
+      fi
+    fi
+    # Skip if nothing actually listening
+    ss -Htnlp 2>/dev/null | grep -q ":$port " || continue
+    echo "[$(date)] tunneling port $port" >> $LOG
+    if [ -n "$SECRET" ]; then
+      BORE_SERVER=$SERVER BORE_SECRET=$SECRET $BORE_BIN local $port --local-host 127.0.0.1 >> $LOG 2>&1 &
+    else
+      BORE_SERVER=$SERVER $BORE_BIN local $port --local-host 127.0.0.1 >> $LOG 2>&1 &
+    fi
+    TUNNELED[$port]=$!
+    sleep 2
+  done
+  sleep 5
+done
+SCRIPT
+chmod +x "${ctx.dirname}/bore-pinokio-auto.sh"
+"${ctx.dirname}/bore-pinokio-auto.sh"
+`
 
     return [{
       method: "input",
       params: {
-        title: "Bore Tunnel",
+        title: "Bore Auto-Tunnel",
+        description: "Start auto-tunneling all running app ports to bore.pub",
         form: [{
-          key: "port",
-          title: "Local app port"
-        }, {
           key: "server",
           title: "Bore server",
-          default: "127.0.0.1"
-        }, {
-          key: "name",
-          title: "Name shown in Home Server",
-          default: "Bore Tunnel"
+          default: "bore.pub"
         }, {
           key: "secret",
           title: "Shared secret (optional)"
         }]
       }
     }, {
-      method: async (req) => {
-        const port = String(req.input.port || "").trim()
-        const server = String(req.input.server || "").trim()
-        const name = String(req.input.name || "Bore Tunnel").trim()
-        const secret = String(req.input.secret || "")
-        if (!/^\d{1,5}$/.test(port) || Number(port) < 1 || Number(port) > 65535) {
-          throw new Error("Enter a local TCP port from 1 to 65535.")
-        }
-        if (!/^(?:[A-Za-z0-9.-]+|\[[0-9A-Fa-f:]+\])$/.test(server)) {
-          throw new Error("Enter the Bore server hostname or IP address without a port.")
-        }
-        return { port, server, name: name || "Bore Tunnel", secret }
-      }
-    }, {
-      method: "local.set",
-      params: {
-        port: "{{input.port}}",
-        server: "{{input.server}}",
-        name: "{{input.name}}",
-        secret: "{{input.secret}}"
-      }
-    }, {
-      when: "{{!local.secret}}",
       method: "shell.run",
       params: {
-        message,
-        path: "{{args.cwd}}",
+        message: script,
+        path: ctx.dirname,
         env: {
-          BORE_SERVER: "{{local.server}}"
+          BORE_SERVER: "{{input.server}}",
+          BORE_SECRET: "{{input.secret}}"
         },
-        on: [{ event: "/listening at .+:(\\d+)/", done: true }],
         input: true
-      }
-    }, {
-      when: "{{local.secret}}",
-      method: "shell.run",
-      params: {
-        message,
-        path: "{{args.cwd}}",
-        env: {
-          BORE_SERVER: "{{local.server}}",
-          BORE_SECRET: "{{local.secret}}"
-        },
-        on: [{ event: "/listening at .+:(\\d+)/", done: true }],
-        input: true
-      }
-    }, {
-      method: "proxy.start",
-      params: {
-        uri: "http://{{local.server}}:{{input.event[1]}}",
-        name: "{{local.name}} · {{input.event[1]}}"
       }
     }]
   }
