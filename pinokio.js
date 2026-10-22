@@ -75,7 +75,7 @@ module.exports = {
     const binary = kernel.platform === "win32"
       ? `"{{dirname}}\\bore.exe"`
       : `"{{dirname}}/bore"`
-    const message = `${binary} local {{input.port}}`
+    const message = `${binary} local {{local.port}}`
 
     return [{
       method: "input",
@@ -87,7 +87,11 @@ module.exports = {
         }, {
           key: "server",
           title: "Bore server",
-          default: "bore.pub"
+          default: "127.0.0.1"
+        }, {
+          key: "name",
+          title: "Name shown in Home Server",
+          default: "Bore Tunnel"
         }, {
           key: "secret",
           title: "Shared secret (optional)"
@@ -97,37 +101,54 @@ module.exports = {
       method: async (req) => {
         const port = String(req.input.port || "").trim()
         const server = String(req.input.server || "").trim()
+        const name = String(req.input.name || "Bore Tunnel").trim()
         const secret = String(req.input.secret || "")
         if (!/^\d{1,5}$/.test(port) || Number(port) < 1 || Number(port) > 65535) {
           throw new Error("Enter a local TCP port from 1 to 65535.")
         }
-        if (!/^(?:[A-Za-z0-9.-]+|\[[0-9A-Fa-f:]+\])(?::\d{1,5})?$/.test(server)) {
-          throw new Error("Enter a hostname or IP address, optionally followed by a port.")
+        if (!/^(?:[A-Za-z0-9.-]+|\[[0-9A-Fa-f:]+\])$/.test(server)) {
+          throw new Error("Enter the Bore server hostname or IP address without a port.")
         }
-        return { port, server, secret }
+        return { port, server, name: name || "Bore Tunnel", secret }
       }
     }, {
-      when: "{{!input.secret}}",
+      method: "local.set",
+      params: {
+        port: "{{input.port}}",
+        server: "{{input.server}}",
+        name: "{{input.name}}",
+        secret: "{{input.secret}}"
+      }
+    }, {
+      when: "{{!local.secret}}",
       method: "shell.run",
       params: {
         message,
         path: "{{args.cwd}}",
         env: {
-          BORE_SERVER: "{{input.server}}"
+          BORE_SERVER: "{{local.server}}"
         },
+        on: [{ event: "/listening at .+:(\\d+)/", done: true }],
         input: true
       }
     }, {
-      when: "{{input.secret}}",
+      when: "{{local.secret}}",
       method: "shell.run",
       params: {
         message,
         path: "{{args.cwd}}",
         env: {
-          BORE_SERVER: "{{input.server}}",
-          BORE_SECRET: "{{input.secret}}"
+          BORE_SERVER: "{{local.server}}",
+          BORE_SECRET: "{{local.secret}}"
         },
+        on: [{ event: "/listening at .+:(\\d+)/", done: true }],
         input: true
+      }
+    }, {
+      method: "proxy.start",
+      params: {
+        uri: "http://{{local.server}}:{{input.event[1]}}",
+        name: "{{local.name}} · {{input.event[1]}}"
       }
     }]
   }
