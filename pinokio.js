@@ -59,7 +59,7 @@ module.exports = {
 
   installed: async (kernel, info, ctx) => {
     const binary = kernel.platform === "win32" ? "bore.exe" : "bore"
-    return await kernel.exists(ctx.dirname, binary)
+    return await kernel.exists(__dirname, binary)
   },
 
   install: async (kernel, info, ctx) => installSteps(kernel, ctx),
