@@ -30,6 +30,28 @@ The watcher checks listening sockets every 5 seconds, verifies each port actuall
 - **Bore server** – defaults to `bore.pub`
 - **Shared secret** – only needed for a private bore server
 
+### Private server, stable names
+
+With a private bore server on your own domain, each app gets a permanent URL
+instead of a random port:
+
+```bash
+BORE_SERVER=eysho.info BORE_SECRET=... PUBLIC_DOMAIN=eysho.info \
+PORT_BASE=43000 PORT_RANGE=1000 ./start.sh
+```
+
+```
+https://pinokio.eysho.info     Pinokio UI (Basic Auth)
+https://comfyui.eysho.info     an app you started in Pinokio
+```
+
+The name comes from the app directory under `~/.pinokio/api`, and the port is
+`PORT_BASE + hash(name) % PORT_RANGE`. The server's router computes the same
+hash, so no registry is needed: see `server/bore-router.js` in
+[bkg-zig/bore.pub](https://github.com/bkg-zig/bore.pub). One subdomain per app;
+extra ports an app opens are ignored. If the wanted port is busy the client
+retries rather than pointing the name at the wrong tunnel.
+
 Logs: `/tmp/bore-auto.log` and `/tmp/bore-<port>.log`
 
 ## Security

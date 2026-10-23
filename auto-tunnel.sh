@@ -35,12 +35,18 @@ STATE_DIR="${STATE_DIR:-$PINOKIO_HOME/tunnels}"
 SKIP_PORTS="${SKIP_PORTS:-22 53 7835 3000 3001 3002 42000 42001}"
 ALLOW_PORTS="${ALLOW_PORTS:-}"
 LOG="${LOG:-/tmp/bore-auto.log}"
+# With a private domain (e.g. eysho.info) each app gets a stable subdomain and
+# a deterministic port, so the URL never changes: app.eysho.info.
+PUBLIC_DOMAIN="${PUBLIC_DOMAIN:-}"
+PORT_BASE="${PORT_BASE:-43000}"
+PORT_RANGE="${PORT_RANGE:-1000}"
 
 mkdir -p "$STATE_DIR"
 PIDFILE="$STATE_DIR/auto-tunnel.pid"
 printf '%s\n' "$$" >"$PIDFILE"
 declare -A TUNNELED=()
 declare -A COOLDOWN=()
+declare -A NAME_PORT=()
 
 log() { printf '[%s] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >>"$LOG"; }
 
@@ -93,6 +99,42 @@ in_app_root() {
   return 1
 }
 
+# App name from the process cwd/cmdline, e.g. "stable-diffusion".
+app_name_for_pid() {
+  local pid="$1" cwd cmd path name
+  cwd="$(readlink "/proc/$pid/cwd" 2>/dev/null)" || cwd=""
+  path=""
+  if [[ -n "$cwd" && "$cwd" == "$APP_ROOT"/* ]]; then
+    path="$cwd"
+  else
+    cmd="$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null)" || cmd=""
+    path="$(printf '%s' "$cmd" | grep -oE "$APP_ROOT/[^ ]+" | head -1)"
+  fi
+  [[ -n "$path" ]] || { echo ""; return; }
+  name="${path#"$APP_ROOT"/}"
+  name="${name%%/*}"
+  # same normalisation as server/bore-router.js
+  printf '%s' "$name" | tr '[:upper:]' '[:lower:]' \
+    | sed -e 's/\.git$//' -e 's/[^a-z0-9-]\+/-/g' -e 's/-\+/-/g' -e 's/^-//' -e 's/-$//' \
+    | cut -c1-40
+}
+
+# Deterministic port for a name; must match hashName() in bore-router.js.
+name_hash() {
+  local s="$1" h=0 i c
+  for ((i = 0; i < ${#s}; i++)); do
+    printf -v c '%d' "'${s:$i:1}"
+    h=$(((h * 131 + c) % 1000003))
+  done
+  echo "$h"
+}
+
+public_port_for() {
+  local name="$1"
+  [[ "$name" == "pinokio" ]] && { echo 42000; return; }
+  echo $((PORT_BASE + ($(name_hash "$name") % PORT_RANGE)))
+}
+
 # "port pid" for every listening TCP socket.
 listen_pairs() {
   ss -Htnlp 2>/dev/null | awk '
@@ -105,8 +147,10 @@ listen_pairs() {
 }
 
 drop() {
-  local port="$1"
+  local port="$1" name
   [[ -n "${TUNNELED[$port]:-}" ]] && kill "${TUNNELED[$port]}" 2>/dev/null
+  name="$(sed -n 's/.*"name": "\([^"]*\)".*/\1/p' "$STATE_DIR/app-$port.json" 2>/dev/null | head -1)"
+  [[ -n "$name" && "${NAME_PORT[$name]:-}" == "$port" ]] && unset "NAME_PORT[$name]"
   unset "TUNNELED[$port]"
   rm -f "$STATE_DIR/app-$port.json"
 }
@@ -151,7 +195,20 @@ while true; do
 
     out="/tmp/bore-$port.log"
     : >"$out"
+    app_name="$(app_name_for_pid "$pid")"
+    [[ -n "$app_name" ]] || app_name="app-$port"
+
+    fixed_port=""
+    if [[ -n "$PUBLIC_DOMAIN" ]]; then
+      # one subdomain per app: the first listening port owns the name
+      if [[ -n "${NAME_PORT[$app_name]:-}" && "${NAME_PORT[$app_name]}" != "$port" ]]; then
+        continue
+      fi
+      fixed_port="$(public_port_for "$app_name")"
+    fi
+
     args=(local "$port" --local-host 127.0.0.1 --to "$SERVER")
+    [[ -n "$fixed_port" ]] && args+=(--port "$fixed_port")
     [[ -n "$SECRET" ]] && args+=(--secret "$SECRET")
     "$BORE_BIN" "${args[@]}" >>"$out" 2>&1 &
     TUNNELED[$port]=$!
@@ -164,20 +221,36 @@ while true; do
       sleep 1
     done
 
+    # With a domain the port must be the one the router computes, otherwise
+    # the subdomain would point at somebody else's tunnel. Retry, never lie.
+    if [[ -n "$url" && -n "$fixed_port" && "${url##*:}" != "$fixed_port" ]]; then
+      kill "${TUNNELED[$port]}" 2>/dev/null
+      unset "TUNNELED[$port]"
+      COOLDOWN[$port]=$((now + 30))
+      log "port $port ($app_name) -> server gave ${url##*:}, wanted $fixed_port; retrying"
+      continue
+    fi
+
     if [[ -n "$url" ]]; then
+      if [[ -n "$PUBLIC_DOMAIN" ]]; then
+        public_url="https://${app_name}.${PUBLIC_DOMAIN}"
+      else
+        public_url="http://$url"
+      fi
       cat >"$STATE_DIR/app-$port.json" <<JSON
 {
-  "name": "app-$port",
+  "name": "$app_name",
   "kind": "app",
   "local_port": $port,
   "public_port": ${url##*:},
-  "url": "http://$url",
+  "url": "$public_url",
   "auth": false,
   "state": "live",
   "updated": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 }
 JSON
-      log "port $port -> http://$url"
+      NAME_PORT[$app_name]="$port"
+      log "port $port ($app_name) -> $public_url"
     else
       kill "${TUNNELED[$port]}" 2>/dev/null
       unset "TUNNELED[$port]"
