@@ -152,125 +152,29 @@ module.exports = {
     },
   ],
 
-  run: async (kernel, info, ctx) => {
-    const b = `"${ctx.dirname}/${binary(kernel)}"`
-    const script = `cat > "${ctx.dirname}/bore-pinokio-auto.sh" << 'SCRIPT'
-#!/bin/bash
-# Auto-tunnel every new listening HTTP port and publish the URL for the dashboard.
-SERVER="\${BORE_SERVER:-bore.pub}"
-SECRET="\${BORE_SECRET:-}"
-BORE_BIN=${b}
-LOG="/tmp/bore-auto.log"
-STATE_DIR="\${PINOKIO_HOME:-$HOME/.pinokio}/tunnels"
-mkdir -p "$STATE_DIR"
-declare -A TUNNELED
-declare -A URLS
-
-echo "[$(date)] bore-auto started server=$SERVER" >> "$LOG"
-
-cleanup() {
-  for port in "\${!TUNNELED[@]}"; do
-    kill "\${TUNNELED[$port]}" 2>/dev/null
-    rm -f "$STATE_DIR/app-$port.json"
-  done
-  exit 0
-}
-trap cleanup INT TERM
-
-while true; do
-  for port in $(ss -Htnl 2>/dev/null | awk '{print $4}' | grep -oE '[0-9]+$' | sort -u); do
-    # skip ssh, dns, pinokiod itself, the auth proxy, and the bore control port
-    case "$port" in
-      22|53|7835|3000|3001|3002|42000|42001) continue ;;
-      "$(cat /tmp/bore-auto-ignore 2>/dev/null)")
-        continue ;;
-    esac
-
-    # already tunnelled and still alive?
-    if [ -n "\${TUNNELED[$port]:-}" ]; then
-      kill -0 "\${TUNNELED[$port]}" 2>/dev/null && continue
-      unset "TUNNELED[$port]" "URLS[$port]"
-      rm -f "$STATE_DIR/app-$port.json"
-    fi
-
-    # only tunnel something that actually speaks HTTP
-    code=$(curl -s -o /dev/null -m 2 -w '%{http_code}' "http://127.0.0.1:$port/" 2>/dev/null)
-    [ "$code" = "000" ] && continue
-
-    out="/tmp/bore-$port.log"
-    : > "$out"
-    if [ -n "$SECRET" ]; then
-      "$BORE_BIN" local "$port" --local-host 127.0.0.1 --to "$SERVER" --secret "$SECRET" >> "$out" 2>&1 &
-    else
-      "$BORE_BIN" local "$port" --local-host 127.0.0.1 --to "$SERVER" >> "$out" 2>&1 &
-    fi
-    TUNNELED[$port]=$!
-
-    url=""
-    for _ in $(seq 1 15); do
-      url=$(sed -e 's/\\x1b\\[[0-9;]*m//g' "$out" 2>/dev/null | grep -oE 'listening at [A-Za-z0-9._-]+:[0-9]+' | tail -1 | awk '{print $3}')
-      [ -n "$url" ] && break
-      sleep 1
-    done
-
-    if [ -n "$url" ]; then
-      URLS[$port]="http://$url"
-      cat > "$STATE_DIR/app-$port.json" << JSON
-{
-  "name": "app-$port",
-  "kind": "app",
-  "local_port": $port,
-  "public_port": \${url##*:},
-  "url": "http://$url",
-  "auth": false,
-  "state": "live",
-  "updated": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-}
-JSON
-      echo "[$(date)] port $port -> http://$url" >> "$LOG"
-    fi
-  done
-
-  # drop entries for ports that stopped listening
-  for port in "\${!TUNNELED[@]}"; do
-    ss -Htnl 2>/dev/null | grep -q ":$port\\b" || {
-      kill "\${TUNNELED[$port]}" 2>/dev/null
-      unset "TUNNELED[$port]" "URLS[$port]"
-      rm -f "$STATE_DIR/app-$port.json"
-    }
-  done
-
-  sleep 5
-done
-SCRIPT
-chmod +x "${ctx.dirname}/bore-pinokio-auto.sh"
-"${ctx.dirname}/bore-pinokio-auto.sh"
-`
-
-    return [
-      {
-        method: "input",
-        params: {
-          title: "Bore Auto-Tunnel",
-          description: "Tunnel every running app port to bore.pub and list the URLs in the dashboard",
-          form: [
-            { key: "server", title: "Bore server", default: "bore.pub" },
-            { key: "secret", title: "Shared secret (optional)" },
-          ],
-        },
+  run: async (kernel, info, ctx) => [
+    {
+      method: "input",
+      params: {
+        title: "Bore Auto-Tunnel",
+        description: "Tunnel every running app port to bore.pub and list the URLs in the dashboard",
+        form: [
+          { key: "server", title: "Bore server", default: "bore.pub" },
+          { key: "secret", title: "Shared secret (optional)" },
+        ],
       },
-      {
-        method: "shell.run",
-        params: {
-          message: script,
-          path: ctx.dirname,
-          env: {
-            BORE_SERVER: "{{input.server}}",
-            BORE_SECRET: "{{input.secret}}",
-          },
-          input: true,
+    },
+    {
+      method: "shell.run",
+      params: {
+        message: 'BORE_BIN="$(pwd)/' + binary(kernel) + '" bash "$(pwd)/auto-tunnel.sh"',
+        path: ctx.dirname,
+        env: {
+          BORE_SERVER: "{{input.server}}",
+          BORE_SECRET: "{{input.secret}}",
         },
+        input: true,
       },
-    ]
-  },
+    },
+  ],
 }
